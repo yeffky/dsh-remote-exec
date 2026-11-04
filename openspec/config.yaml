@@ -1,0 +1,27 @@
+schema: spec-driven
+context: |
+  Project: dsh-remote-exec, a DeepSeek Harness plugin that runs an agent's shell and
+  filesystem work on a remote execution host while the agent loop stays in the cloud.
+  Product context: docs/009-research-brain-hands.md in dsh-superagent, and the
+  super-agent design article section 5 (compute/state/environment separation) and
+  section 8.4 (security and privacy are open problems).
+  Core user: an operator who keeps a real development environment (uncommitted
+  changes, private credentials, internal services, specific toolchains) on a machine
+  that must not be replaced by a cloud sandbox.
+  Current iteration: shell remote execution with a bubblewrap backend, credential
+  proxying so the remote host never holds a real token, an audit trail, and a
+  three-layer policy that can only tighten.
+  Out of scope for now: filesystem remote execution, multi-device scheduling,
+  and a UI beyond the existing DSH tool surfaces.
+rules:
+  proposal:
+    - Write in Chinese and state user value, scope, exclusions, and dependencies.
+  specs:
+    - Use normative SHALL statements and observable acceptance scenarios.
+    - Every security property must be stated as a testable requirement.
+  design:
+    - Document the trust boundary, failure behavior, and what the remote host can see.
+    - Name the DSH seam each capability replaces and why.
+  tasks:
+    - Split work into independently reviewable implementation steps.
+    - Each task names the spec requirement it satisfies.
