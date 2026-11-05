@@ -1,0 +1,19 @@
+{
+  "name": "dsh-remote-exec",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Run a DeepSeek Harness agent's shell work on the machine that holds the real execution environment.",
+  "exports": {
+    ".": "./src/cloud/plugin-shell.mjs",
+    "./shell": "./src/cloud/plugin-shell.mjs",
+    "./daemon": "./src/daemon/daemon.mjs"
+  },
+  "scripts": {
+    "test": "node test/shell.test.mjs",
+    "daemon": "node src/daemon/daemon.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.22.1"
+  }
+}
