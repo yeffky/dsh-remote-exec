@@ -7,3 +7,7 @@ dist/
 coverage/
 .idea/
 .vscode/
+
+# 本机推送脚本：依赖本机的 gh 路径与被 super-agent 污染的环境变量，
+# 只对本机有效，不作为仓库内容分发。
+scripts/
