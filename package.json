@@ -5,15 +5,49 @@
   "type": "module",
   "description": "Run a DeepSeek Harness agent's shell work on the machine that holds the real execution environment.",
   "exports": {
-    ".": "./src/cloud/plugin-shell.mjs",
-    "./shell": "./src/cloud/plugin-shell.mjs",
-    "./daemon": "./src/daemon/daemon.mjs"
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./hub": {
+      "types": "./lib/plugin-hub.d.ts",
+      "default": "./lib/plugin-hub.js"
+    },
+    "./daemon": "./lib/daemon.js",
+    "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "README.md"
+  ],
   "scripts": {
-    "test": "node test/shell.test.mjs",
-    "daemon": "node src/daemon/daemon.mjs"
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "daemon": "node lib/daemon.js"
   },
   "dependencies": {
     "ws": "^8.22.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-shell": "^0.2.1-alpha.2",
+    "@deepseek-ai/dsh-subprocess": "^0.2.1-alpha.2",
+    "@deepseek-ai/schemastery": "^3.18.5-alpha.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "file:/home/zjk/.local/share/npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-shell": "file:/home/zjk/.local/share/npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-shell",
+    "@types/node": "22.20.0",
+    "@types/ws": "8.18.1",
+    "tsdown": "0.22.14",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8",
+    "@deepseek-ai/dsh-subprocess": "file:/home/zjk/.local/share/npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess",
+    "@deepseek-ai/schemastery": "file:/home/zjk/.local/share/npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
   }
 }
