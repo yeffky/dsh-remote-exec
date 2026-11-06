@@ -3,9 +3,9 @@
 Run a DeepSeek Harness agent's shell work on the machine that holds the real
 execution environment, while the agent loop stays in the cloud.
 
-> **Status: design stage.** The OpenSpec change documents are written; the
-> implementation has not started. The prototype this repository replaces is
-> described in `docs/000-provenance.md`.
+> **Status: shell execution implemented and unit-tested; not yet verified on a
+> live DSH deployment.** See `openspec/changes/remote-shell/tasks.md` for exactly
+> what is and is not done.
 
 ## Why
 
@@ -25,13 +25,64 @@ the commands.
 | `ctx.shell` | remote (execution host) | |
 | `ctx.subprocess` | | yes — setup and session restore depend on it |
 
-Replacing `ctx.subprocess` instead breaks two control-plane paths; see
-`openspec/changes/remote-shell/design.md`.
+Replacing `ctx.subprocess` instead breaks two control-plane paths; the measured
+difference is in [`docs/001-architecture.md`](docs/001-architecture.md).
+
+## Install and configure
+
+```sh
+pnpm install
+pnpm build
+```
+
+Two profile entries are needed. The first owns the connection; the second swaps
+the shell implementation:
+
+```yaml
+- id: remote-exec-hub
+  name: dsh-remote-exec/hub
+  config:
+    port: 7777
+    host: 0.0.0.0        # 0.0.0.0 only inside a container that maps the port
+    token: <shared secret>
+
+- id: bash-remote
+  name: dsh-remote-exec
+  config:
+    cwd: /work
+    timeoutMs: 5000
+    maxTimeoutMs: 5000
+```
+
+The local shell implementation must be disabled, because a context holds only one
+`ctx.shell`:
+
+```yaml
+- id: bash-sandbox
+  disabled: true
+```
+
+## Start the execution host
+
+```sh
+node lib/daemon.js \
+  --endpoint ws://<agent-loop-host>:7777 \
+  --token <shared secret> \
+  --work-root /path/to/work
+```
+
+The daemon connects out, so the execution host needs no inbound port and works
+behind NAT. It keeps no state: restarting it only reconnects.
+
+`--work-root` is the only boundary enforced today — a command whose `cwd` falls
+outside it is refused before it runs.
 
 ## Documentation
 
 The specification lives in `openspec/`. Read in this order:
 
+- [`docs/000-provenance.md`](docs/000-provenance.md) — where the design comes from
+- [`docs/001-architecture.md`](docs/001-architecture.md) — seam choice, trust boundary, failure semantics
 - `openspec/specs/remote-execution/spec.md` — what remote execution must do
 - `openspec/specs/credential-proxy/spec.md` — how credentials stay off the host
 - `openspec/specs/execution-sandbox/spec.md` — what a command may read, write, reach
@@ -41,11 +92,16 @@ The specification lives in `openspec/`. Read in this order:
 
 ## Known limitations
 
-- **No sandbox yet.** The shell change declares `sandboxMode: workspace-write` so
-  that `dsh-permission-presets` composes, but the only enforcement in that change
-  is a working-directory check. The `execution-sandbox` change replaces it with a
-  bubblewrap backend. Until then, treat the execution host as unconfined.
-- **One execution host.** Multi-device selection is not implemented.
+- **The sandbox declaration is incomplete.** The shell plugin reports
+  `sandboxMode: 'workspace-write'` so `dsh-permission-presets` composes, but the
+  only enforcement is the `--work-root` check. A running command can still read
+  and write anything that user can, and reach any network. Treat the execution
+  host as unconfined until `execution-sandbox` lands.
+- **Credentials are still on the execution host.** `credential-proxy` has not
+  been implemented, so the host's git configuration holds a real token.
+- **Filesystem work is not remote.** `ctx.fs` still points at the agent loop's
+  machine, so an Executor cannot see the files on the execution host.
+- **One execution host.** `hub.peer()` takes the first connected device.
 - **No terminal.** `spawnTerminal` is unimplemented.
 
 ## License
