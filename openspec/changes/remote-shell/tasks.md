@@ -59,12 +59,21 @@
 
 ## 6. 在真实 DSH 上验证
 
-- [ ] 6.1 在 super-agent profile 中加载插件，确认启动无 warning。满足 `remote-execution`：The agent loop keeps control-plane work。
-- [ ] 6.2 端到端：飞书触发「执行 hostname」，断言返回值是执行主机的主机名。满足 `remote-execution`：A command runs on the execution host。
-- [ ] 6.3 反向验证：不启动 daemon 时命令失败且不本地回退。满足 `remote-execution`：No host is connected。
+- [x] 6.1 在 super-agent profile 中加载插件，确认启动无 warning。满足 `remote-execution`：The agent loop keeps control-plane work。
+      — 在云端 super-agent 上加载，启动零 warning；`ctx.shell` 注册成功，`ctx.subprocess` 保持本地。
+        过程中修复三处装配问题：hub 须用 `Service` 注册而非 `provide`；`inject` 是条目配置项
+        而非模块导出；主 profile 也需一个 shell 提供者以满足 permission 插件组合。
+- [x] 6.2 端到端：飞书触发「执行 hostname」，断言返回值是执行主机的主机名。满足 `remote-execution`：A command runs on the execution host。
+      — 飞书消息触发 → Eval accept → Ticket → Executor 执行，返回 `DESKTOP-3P0UU25`（执行主机名），
+        而非云端容器名 `06176fcb60f4`。
+- [x] 6.3 反向验证：不启动 daemon 时命令失败且不本地回退。满足 `remote-execution`：No host is connected。
+      — 停止 daemon 后触发，所有 bash 调用返回「没有可用的端侧 daemon 连接」；Executor 重试三次
+        后如实报告阻塞，未回退到云端执行，未返回任何云端路径。
 
-> 6.1–6.3 需要在真实 DSH 部署上执行，属于后续阶段。原型阶段曾在同类环境
-> 手工验证过该链路，但不构成本仓库的可复现验收。
+> 6.1–6.3 已于 2026-11-06 在真实 super-agent 部署上验证通过。验证中观察到一处
+> 已知限制：Ticket 目录在云端而执行主机的工作根不同，Executor 会降级到工作根内执行；
+> 对 `hostname` 这类与环境无关的命令结果不受影响，但文件类任务需要 `ctx.fs` 远程化
+> 之后才能正确工作。
 
 ## 7. 文档
 

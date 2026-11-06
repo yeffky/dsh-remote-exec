@@ -33,7 +33,7 @@ export type ConfigType = ReturnType<typeof Config>
 
 export const name = 'dsh-remote-exec-shell'
 /** 依赖连接服务；缺少时本条目保持 pending 而不是自行监听端口。 */
-export const inject = ['remoteExecHub'] as const
+export const inject: string[] = ['remoteExecHub']
 
 /**
  * Cordis 插件入口。
@@ -42,7 +42,10 @@ export const inject = ['remoteExecHub'] as const
  * 实现，因此部署时需禁用本地实现（`bash-sandbox` / `bash-local`）。
  */
 export function apply(ctx: Context, config: ConfigType): void {
-  const hub = ctx.get('remoteExecHub') as RemoteHub | undefined
+  // 服务值是 RemoteExecHub 实例，底层连接在其 hub 字段上。
+  // 用属性访问而非 ctx.get：cordis 的 Proxy 只在属性读取时按 inject 解析服务。
+  const service = (ctx as unknown as { remoteExecHub?: { hub?: RemoteHub } }).remoteExecHub
+  const hub = service?.hub
   if (hub === undefined) throw new Error('dsh-remote-exec: 缺少 remoteExecHub，请先加载 dsh-remote-exec/hub')
 
   const remote = new RemoteShellExecutor(hub, config)

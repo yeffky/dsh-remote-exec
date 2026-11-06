@@ -1,14 +1,14 @@
 /**
  * dsh-remote-exec：连接服务
  *
- * 把执行设备的连接管理拆成独立 service（`ctx.remoteExecHub`），使同一进程内的
- * 多个插件条目共享一条连接，而无需借助 `globalThis`。
+ * 把执行设备的连接管理注册为 `ctx.remoteExecHub`，使同一进程内的多个插件条目
+ * 共享一条连接，而无需借助 `globalThis`。
  *
- * 为什么独立：worker preset 运行在 `isolate` 作用域内，看不到主 Context 的
- * 普通服务；`Service` 在 isolate 里按名查找时，同名服务的提供者会沿 fiber 树
- * 向上查找，因此本 service 需要单独注册在能被两者共同看到的 Context 上。
+ * 为什么拆成独立条目：worker preset 运行在 `isolate` 作用域内，看不到主 Context
+ * 的普通服务；把连接做成命名服务后，`isolate` 内的条目仍能按名解析到它。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { RemoteHub } from './hub.ts'
 
@@ -23,27 +23,33 @@ export type ConfigType = ReturnType<typeof Config>
 
 export const name = 'dsh-remote-exec-hub'
 /** 无依赖：本服务是被其他条目消费的基础设施。 */
-export const inject = [] as const
+export const inject: string[] = []
 
 /**
- * 注册 `ctx.remoteExecHub`。
+ * 连接服务。
  *
- * 只在首个条目上实例化；重复加载时 cordis 会因同名服务已注册而报错，这是
- * 期望行为——一条连接只应有一个监听者。
+ * `Service` 的构造会把实例注册到 `ctx` 的指定名字下，并在所属 fiber 卸载时自动
+ * 注销，因此不需要手写 `provide`。服务值就是本实例，`hub` 暴露底层连接对象。
  */
+export class RemoteExecHub extends Service<never> {
+  readonly hub: RemoteHub
+
+  constructor(ctx: Context, config: ConfigType) {
+    super(ctx, 'remoteExecHub')
+    this.hub = new RemoteHub({
+      port: config.port,
+      host: config.host,
+      token: config.token,
+      onPeer: (peer) => { ctx.logger?.info?.('dsh-remote-exec: 端侧设备接入 id=%s', peer.id) },
+    })
+    ctx.effect(() => () => { this.hub.close() }, 'remote exec hub teardown')
+    ctx.logger?.info?.('dsh-remote-exec: hub 监听 ws://%s:%s', config.host, config.port)
+  }
+}
+
 export function apply(ctx: Context, config: ConfigType): void {
-  const hub = new RemoteHub({
-    port: config.port,
-    host: config.host,
-    token: config.token,
-    onPeer: (peer) => { ctx.logger?.info?.('dsh-remote-exec: 端侧设备接入 id=%s', peer.id) },
-  })
-
-  ctx.provide('remoteExecHub')
-  ctx.set?.('remoteExecHub', hub)
-
-  ctx.effect(() => () => { hub.close() }, 'remote exec hub teardown')
-  ctx.logger?.info?.('dsh-remote-exec: hub 监听 ws://%s:%s', config.host, config.port)
+  // 构造即注册；实例本身就是 ctx.remoteExecHub。
+  new RemoteExecHub(ctx, config)
 }
 
 export default apply
