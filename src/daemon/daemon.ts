@@ -12,7 +12,9 @@
  *   node daemon.js --endpoint ws://host:7777 --token <secret> --work-root /path/to/work
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { resolve, sep } from 'node:path'
+import { dirname, resolve, sep } from 'node:path'
+import { existsSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { WebSocket } from 'ws'
 import { Methods, Events, event, result, failure, parse } from '../shared/protocol.ts'
 import type { ShellExecParams, TerminateParams } from '../shared/protocol.ts'
@@ -39,9 +41,19 @@ const ENDPOINT = argOf('endpoint', process.env.REMOTE_ENDPOINT) ?? 'ws://127.0.0
 const TOKEN = argOf('token', process.env.DAEMON_TOKEN) ?? ''
 const DEFAULT_GRACE = Number(argOf('grace', process.env.GRACE_MS) ?? DEFAULT_GRACE_MS)
 
-/** 执行允许的工作根；`cwd` 必须落在它之下，这是当前唯一的安全边界。 */
+/** 执行允许的工作根；`dir` 相对它解析，越界的标识被拒绝。 */
 function workRoot(): string {
   return argOf('work-root', process.env.WORK_ROOT) ?? '/tmp'
+}
+
+/**
+ * 目录不存在时要跑的准备命令，`$DIR` 会被替换成目标目录。
+ *
+ * 典型值是建一个 git worktree。留空表示不准备，直接在新目录里执行——对
+ * 与环境无关的命令（如 hostname）够用，需要源码的命令则必须配它。
+ */
+function prepareCommand(): string {
+  return argOf('prepare', process.env.PREPARE_COMMAND) ?? ''
 }
 
 const log = (...a: unknown[]): void => {
@@ -93,18 +105,70 @@ function pipeOutput(spawnId: string, stream: 'stdout' | 'stderr', source: NodeJS
 }
 
 /** 执行一条 shell 命令。命令交给 `bash -lc` 解释，与 bash-local 一致。 */
+/**
+ * 执行一条 shell 命令。
+ *
+ * `dir` 来自云端，是**相对标识**而非绝对路径：执行主机自己决定目录根。拼接后
+ * 若目录还不存在，先用 `--prepare` 给的命令准备它（通常是建 git worktree），
+ * 再执行用户的命令。准备命令失败时整个请求失败，不会在空目录里继续跑。
+ */
 function handleShellExec(id: number, params: ShellExecParams): void {
-  const { spawnId, command, cwd, env, graceMs, stdin } = params
+  const { spawnId, command, dir, env, graceMs, stdin } = params
   if (typeof command !== 'string' || command === '') return fail(id, 'command is required')
   if (live.has(spawnId)) return fail(id, `spawnId ${spawnId} already active`)
 
-  // 边界：云端声明了 workspace-write，这里必须真正限制工作目录。
-  const root = resolve(workRoot())
-  const target = resolve(cwd === '' || cwd === undefined ? root : cwd)
-  if (target !== root && !target.startsWith(root + sep)) {
-    return fail(id, `cwd 超出允许范围: ${target} 不在 ${root} 下`)
-  }
+  let target: string
+  try { target = resolveDir(dir) } catch (error) { return fail(id, error) }
 
+  void runWithPrepare(id, spawnId, target, command, env, graceMs, stdin)
+}
+
+/** 把云端给的相对标识拼到本机的 work-root 上，拒绝越界的标识。 */
+function resolveDir(dir: string): string {
+  const root = resolve(workRoot())
+  if (dir === '' || dir === '.') return root
+  const target = resolve(root, dir)
+  if (target !== root && !target.startsWith(root + sep)) {
+    throw new Error(`dir 超出工作根: ${dir} 解析为 ${target}，不在 ${root} 下`)
+  }
+  return target
+}
+
+/** 目录不存在时先跑准备命令，再执行用户命令；准备失败则整个请求失败。 */
+async function runWithPrepare(id: number, spawnId: string, target: string, command: string,
+  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined): Promise<void> {
+  if (!existsSync(target)) {
+    const prepare = prepareCommand()
+    if (prepare === '') {
+      // 没有准备命令时建空目录：与环境无关的命令（如 hostname）仍可执行。
+      try { await mkdir(target, { recursive: true }) }
+      catch (error) { return fail(id, `创建目录失败: ${error instanceof Error ? error.message : String(error)}`) }
+    } else {
+      try { await runPrepare(prepare, target) }
+      catch (error) { return fail(id, `准备目录失败: ${error instanceof Error ? error.message : String(error)}`) }
+    }
+  }
+  startCommand(id, spawnId, target, command, env, graceMs, stdin)
+}
+
+/** 在本机跑一次准备命令；`$DIR` 已替换为目标目录。 */
+async function runPrepare(template: string, target: string): Promise<void> {
+  await mkdir(dirname(target), { recursive: true })
+  const command = template.replaceAll('$DIR', target)
+  await new Promise<void>((done, reject) => {
+    const child = spawn('bash', ['-lc', command], { env: scrubbedEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let err = ''
+    child.stderr?.on('data', (chunk: Buffer) => { err += chunk.toString('utf8') })
+    child.on('error', (error: Error) => { reject(new Error(`${error.message}\n${err}`.trim())) })
+    child.on('close', (code) => {
+      if (code === 0) done()
+      else reject(new Error(err.trim() || `prepare exited with ${code}`))
+    })
+  })
+}
+
+function startCommand(id: number, spawnId: string, target: string, command: string,
+  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined): void {
   const child = spawn('bash', ['-lc', command], {
     cwd: target,
     env: { ...scrubbedEnv(), ...(env ?? {}) },
@@ -117,6 +181,7 @@ function handleShellExec(id: number, params: ShellExecParams): void {
     exited: false,
     exitInfo: null,
   }
+  live.set(spawnId, entry)
   live.set(spawnId, entry)
 
   if (stdin !== undefined && child.stdin !== null) child.stdin.end(String(stdin))
@@ -193,6 +258,8 @@ function connect(): void {
       hostname: process.env.HOSTNAME ?? 'unknown',
       platform: process.platform,
       pid: process.pid,
+      // 云端据此把绝对路径翻译成相对标识，因而无需知道本机的磁盘布局。
+      workRoot: resolve(workRoot()),
     })
   })
 

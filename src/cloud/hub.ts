@@ -45,6 +45,13 @@ interface PendingCall {
 export class Peer {
   readonly id: string
   readonly socket: WebSocket
+  /**
+   * 执行主机存放工单目录的根，由它的 `ready` 事件上报。
+   *
+   * 云端用它把 super-agent 算出的绝对路径翻译成相对标识，因此不必知道执行
+   * 主机的磁盘布局；在 `ready` 到达前为 undefined。
+   */
+  workRoot?: string
   /** 尚未收到响应的请求，按请求 id 索引。 */
   private readonly pending = new Map<number, PendingCall>()
   /** 云端视角下正在跑的远程命令，按 spawnId 索引。 */
@@ -83,6 +90,10 @@ export class Peer {
     const state = spawnId === undefined ? undefined : this.spawns.get(spawnId)
 
     switch (method) {
+      case Events.Ready:
+        // 执行主机自报目录根；云端据此翻译路径，而不是假设一个布局。
+        if (typeof params.workRoot === 'string' && params.workRoot !== '') this.workRoot = params.workRoot
+        break
       case Events.Spawned:
         if (state && typeof params.pid === 'number') state.notify()
         break

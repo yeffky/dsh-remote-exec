@@ -30,11 +30,18 @@ export const Events = {
 
 export type EventName = (typeof Events)[keyof typeof Events]
 
-/** 一次 shellExec 请求。`stdin` 为 undefined 表示不给子进程输入。 */
+/**
+ * 一次 shellExec 请求。
+ *
+ * `dir` 是**相对标识**（例如工单目录的最后一段），不是绝对路径：目录根由执行
+ * 主机自己决定，它把 `dir` 拼到自己的 work-root 上。云端因此不需要知道执行
+ * 主机的磁盘布局，这正是原文「按需读取其中的上下文」的含义。
+ */
 export interface ShellExecParams {
   spawnId: string
   command: string
-  cwd: string
+  /** 相对于执行主机 work-root 的目录标识；空串表示 work-root 本身。 */
+  dir: string
   env?: Record<string, string>
   graceMs?: number
   stdin?: string
@@ -46,11 +53,17 @@ export interface TerminateParams {
   graceMs?: number
 }
 
-/** 端侧连上后上报的环境事实，云端据此展示与审计。 */
+/**
+ * 端侧连上后上报的环境事实。
+ *
+ * `workRoot` 是执行主机存放工单目录的根，云端用它把绝对路径翻译成相对标识。
+ * 这是环境探测的最小形态：云端只问「你的根在哪」，不问「你有什么工具链」。
+ */
 export interface ReadyParams {
   hostname: string
   platform: string
   pid: number
+  workRoot: string
 }
 
 /** 子进程已启动。 */

@@ -11,7 +11,7 @@ import { RemoteShellExecutor } from '../src/cloud/shell-remote.ts'
 
 const PORT = 7820
 const TOKEN = 'shell-test'
-const WORK_ROOT = '/tmp'
+const WORK_ROOT = '/tmp/dre-test/work'
 /** 等待 daemon 建立连接的轮询上限。 */
 const CONNECT_TIMEOUT_MS = 10_000
 
@@ -59,6 +59,23 @@ describe('端侧连接', () => {
   it('daemon 主动连上云端', () => {
     expect(hub.connected).toBe(true)
   })
+
+  it('上报工作根，供云端翻译路径', () => {
+    // 这是环境探测的最小形态：云端问「你的根在哪」，而不是假设一个布局。
+    expect(hub.peer().workRoot).toBe(WORK_ROOT)
+  })
+})
+
+describe('目录准备', () => {
+  it('目录不存在时自动创建', async () => {
+    const dir = `${WORK_ROOT}/auto-created`
+    const result = await (await shell.execute(shell.resolve({
+      command: 'pwd',
+      workdir: dir,
+    }))).result()
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.text.trim()).toBe(dir)
+  })
 })
 
 describe('resolve 的默认值与上限', () => {
@@ -94,21 +111,24 @@ describe('执行语义', () => {
     expect(await execution.result()).toBe(first)
   })
 
-  it('在指定工作目录执行', async () => {
+  it('把绝对路径翻译成执行主机的相对目录', async () => {
+    // 云端给出的是自己机器上的绝对路径；执行主机应拼到自己的根上，
+    // 而不是试图访问那个不存在的绝对路径。
     const result = await (await shell.execute(shell.resolve({
       command: 'pwd',
-      workdir: WORK_ROOT,
+      workdir: `${WORK_ROOT}/run-demo`,
     }))).result()
-    expect(result.stdout.text.trim()).toBe(WORK_ROOT)
+    expect(result.stdout.text.trim()).toBe(`${WORK_ROOT}/run-demo`)
   })
 
-  it('拒绝工作根之外的目录', async () => {
+  it('相对标识不能逃出工作根', async () => {
+    // 翻译只取最后一段，因此 `/home/../../etc` 这类路径不会把命令带到根之外。
     const result = await (await shell.execute(shell.resolve({
       command: 'pwd',
-      workdir: '/home',
+      workdir: '/home/whatever',
     }))).result()
-    // 边界检查让命令不执行，因此不会有 /home 的输出
-    expect(result.stdout.text).not.toContain('/home')
+    expect(result.stdout.text.trim().startsWith(WORK_ROOT)).toBe(true)
+    expect(result.stdout.text.trim()).not.toContain('/home/whatever')
   })
 })
 

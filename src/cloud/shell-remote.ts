@@ -23,6 +23,7 @@ import type {
   ShellProcessStatus,
   ShellRunResult,
 } from '@deepseek-ai/dsh-shell'
+import { basename } from 'node:path'
 import type { SubprocessOutputRead } from '@deepseek-ai/dsh-subprocess'
 import { Methods } from '../shared/protocol.ts'
 import type { ExitInfo, Peer, RemoteHub, SpawnState } from './hub.ts'
@@ -246,6 +247,25 @@ export class RemoteShellExecutor {
     }
   }
 
+  /**
+   * 把云端算出的绝对路径翻译成执行主机的相对目录标识。
+   *
+   * super-agent 用 `<executionRoot>/<ticket>` 给每个工单分配目录，这个路径只在
+   * agent loop 所在的机器上有意义；执行主机有它自己的根，由 `ready` 上报。
+   * 我们只取最后一段作为标识，由执行主机拼到自己的根上——云端因此不需要知道
+   * 执行主机的磁盘布局，执行主机也不需要理解工单是什么。
+   */
+  private dirFor(peer: Peer, workdir: string): string {
+    const root = peer.workRoot
+    if (root !== undefined) {
+      // 路径已落在执行主机的根之下时，取相对部分，保留可能的多级子目录。
+      const prefix = `${root.replace(/\/+$/, '')}/`
+      if (workdir.startsWith(prefix)) return workdir.slice(prefix.length)
+    }
+    // 否则只保留最后一段：`<任意根>/<ticket>` 的结构由 super-agent 决定。
+    return basename(workdir)
+  }
+
   /** 启动远程命令，返回 live handle。 */
   async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     const peer: Peer = this.hub.peer()
@@ -282,7 +302,7 @@ export class RemoteShellExecutor {
     peer.call(Methods.ShellExec, {
       spawnId,
       command: spec.command,
-      cwd: spec.workdir,
+      dir: this.dirFor(peer, spec.workdir),
       env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
       graceMs: this.config.graceMs,
       ...spec.stdin === undefined ? {} : { stdin: spec.stdin },
