@@ -11,18 +11,28 @@
  * 用法：
  *   node daemon.js --endpoint ws://host:7777 --token <secret> --work-root /path/to/work
  */
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { dirname, resolve, sep } from 'node:path'
 import { existsSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { lstat, mkdir, realpath, rm } from 'node:fs/promises'
+import { promisify } from 'node:util'
 import { WebSocket } from 'ws'
 import { Methods, Events, event, result, failure, parse } from '../shared/protocol.ts'
 import type { ShellExecParams, TerminateParams } from '../shared/protocol.ts'
 
 /** 默认 SIGTERM 到 SIGKILL 的宽限期。 */
 const DEFAULT_GRACE_MS = 3_000
+const PREPARE_TIMEOUT_MS = 10 * 60_000
 /** 命令输出的单块上限，避免一次写入过大帧。 */
 const CHUNK_LIMIT = 64 * 1024
+const execFileAsync = promisify(execFile)
+const PREPARE_ENV_KEYS = [
+  'DSH_SUPERAGENT_GITHUB_REPOSITORY',
+  'DSH_SUPERAGENT_GITHUB_NUMBER',
+  'DSH_SUPERAGENT_GITHUB_PR_HEAD',
+  'DSH_SUPERAGENT_NAME',
+  'DSH_SUPERAGENT_TICKET',
+] as const
 
 interface LiveProcess {
   child: ChildProcess
@@ -62,6 +72,10 @@ const log = (...a: unknown[]): void => {
 
 /** 活跃进程，按 spawnId 索引。连接断开时全部清理。 */
 const live = new Map<string, LiveProcess>()
+const workspacePreparation = new Map<string, Promise<void>>()
+const preparingSpawns = new Set<string>()
+const cancelledSpawns = new Set<string>()
+const disconnectedSpawns = new Set<string>()
 
 let ws: WebSocket | undefined
 let reconnectDelay = 1_000
@@ -113,14 +127,44 @@ function pipeOutput(spawnId: string, stream: 'stdout' | 'stderr', source: NodeJS
  * 再执行用户的命令。准备命令失败时整个请求失败，不会在空目录里继续跑。
  */
 function handleShellExec(id: number, params: ShellExecParams): void {
-  const { spawnId, command, dir, env, graceMs, stdin } = params
+  const { spawnId, command, dir, env, graceMs, stdin, workspace } = params
   if (typeof command !== 'string' || command === '') return fail(id, 'command is required')
   if (live.has(spawnId)) return fail(id, `spawnId ${spawnId} already active`)
 
   let target: string
-  try { target = resolveDir(dir) } catch (error) { return fail(id, error) }
+  try {
+    if (workspace !== undefined) {
+      validateWorkspace(workspace)
+      if (dir !== workspace.ticket) throw new Error('Ticket workspace directory does not match its ticket identifier')
+      target = resolveDir(workspace.ticket)
+    } else {
+      target = resolveDir(dir)
+    }
+  } catch (error) { return fail(id, error) }
 
-  void runWithPrepare(id, spawnId, target, command, env, graceMs, stdin)
+  preparingSpawns.add(spawnId)
+  void runWithPrepare(id, spawnId, target, command, env, graceMs, stdin, workspace)
+    .finally(() => {
+      preparingSpawns.delete(spawnId)
+      cancelledSpawns.delete(spawnId)
+      disconnectedSpawns.delete(spawnId)
+    })
+}
+
+function validateWorkspace(workspace: NonNullable<ShellExecParams['workspace']>): void {
+  const repositoryParts = workspace.repository.split('/')
+  if (repositoryParts.length !== 2 || repositoryParts.some(part =>
+    !/^[A-Za-z0-9_.-]{1,100}$/.test(part) || part === '.' || part === '..')) {
+    throw new Error(`invalid GitHub repository identifier: ${workspace.repository}`)
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(workspace.ticket)) {
+    throw new Error(`invalid Superagent ticket identifier: ${workspace.ticket}`)
+  }
+  for (const [label, value] of [['name', workspace.name], ['number', workspace.number], ['pull request ref', workspace.prHead]] as const) {
+    if (value !== undefined && (value.length > 256 || value.includes('\0'))) {
+      throw new Error(`invalid ${label} in workspace context`)
+    }
+  }
 }
 
 /** 把云端给的相对标识拼到本机的 work-root 上，拒绝越界的标识。 */
@@ -128,39 +172,203 @@ function resolveDir(dir: string): string {
   const root = resolve(workRoot())
   if (dir === '' || dir === '.') return root
   const target = resolve(root, dir)
-  if (target !== root && !target.startsWith(root + sep)) {
+  if (!isWithin(root, target)) {
     throw new Error(`dir 超出工作根: ${dir} 解析为 ${target}，不在 ${root} 下`)
   }
   return target
 }
 
+function isWithin(root: string, target: string): boolean {
+  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)
+}
+
 /** 目录不存在时先跑准备命令，再执行用户命令；准备失败则整个请求失败。 */
 async function runWithPrepare(id: number, spawnId: string, target: string, command: string,
-  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined): Promise<void> {
+  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined,
+  workspace?: ShellExecParams['workspace']): Promise<void> {
+  if (workspace !== undefined) {
+    try { await ensureWorkspaceReady(target, env, workspace) }
+    catch (error) {
+      if (disconnectedSpawns.has(spawnId)) return
+      return fail(id, error)
+    }
+    if (cancelledSpawns.has(spawnId)) {
+      if (!disconnectedSpawns.has(spawnId)) fail(id, 'execution cancelled during workspace preparation')
+      return
+    }
+    startCommand(id, spawnId, target, command, env, graceMs, stdin, workspace)
+    return
+  }
+
+  try { await ensureWithinWorkRoot(target) }
+  catch (error) {
+    if (disconnectedSpawns.has(spawnId)) return
+    return fail(id, error)
+  }
+
+  if (cancelledSpawns.has(spawnId)) {
+    if (!disconnectedSpawns.has(spawnId)) fail(id, 'execution cancelled during directory preparation')
+    return
+  }
+
   if (!existsSync(target)) {
     const prepare = prepareCommand()
     if (prepare === '') {
       // 没有准备命令时建空目录：与环境无关的命令（如 hostname）仍可执行。
       try { await mkdir(target, { recursive: true }) }
-      catch (error) { return fail(id, `创建目录失败: ${error instanceof Error ? error.message : String(error)}`) }
+      catch (error) {
+        if (disconnectedSpawns.has(spawnId)) return
+        return fail(id, `创建目录失败: ${error instanceof Error ? error.message : String(error)}`)
+      }
     } else {
-      try { await runPrepare(prepare, target) }
-      catch (error) { return fail(id, `准备目录失败: ${error instanceof Error ? error.message : String(error)}`) }
+      try { await runPrepare(prepare, target, env, workspace) }
+      catch (error) {
+        if (disconnectedSpawns.has(spawnId)) return
+        return fail(id, `准备目录失败: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
+  }
+
+  if (cancelledSpawns.has(spawnId)) {
+    if (!disconnectedSpawns.has(spawnId)) fail(id, 'execution cancelled during directory preparation')
+    return
   }
   startCommand(id, spawnId, target, command, env, graceMs, stdin)
 }
 
-/** 在本机跑一次准备命令；`$DIR` 已替换为目标目录。 */
-async function runPrepare(template: string, target: string): Promise<void> {
+async function ensureWorkspaceReady(target: string, env: Record<string, string> | undefined,
+  workspace: NonNullable<ShellExecParams['workspace']>): Promise<void> {
+  let preparation = workspacePreparation.get(target)
+  if (preparation === undefined) {
+    preparation = Promise.resolve().then(async () => {
+      await ensureWithinWorkRoot(target)
+      let createdByPrepare = false
+      if (!existsSync(target)) {
+        const prepare = prepareCommand()
+        if (prepare === '') throw new Error(`remote workspace ${workspace.repository} requires a daemon --prepare command`)
+        try {
+          await runPrepare(prepare, target, env, workspace)
+          createdByPrepare = true
+        } catch (error) {
+          await rm(target, { recursive: true, force: true }).catch(() => {})
+          throw error
+        }
+      }
+      try {
+        await ensureWithinWorkRoot(target)
+        await verifyWorkspace(target, workspace.repository)
+      } catch (error) {
+        if (createdByPrepare) await rm(target, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+    })
+    workspacePreparation.set(target, preparation)
+  }
+  try { await preparation }
+  finally {
+    if (workspacePreparation.get(target) === preparation) workspacePreparation.delete(target)
+  }
+}
+
+async function ensureWithinWorkRoot(target: string): Promise<void> {
+  const root = resolve(workRoot())
+  await mkdir(root, { recursive: true })
+  const canonicalRoot = await realpath(root)
+  try {
+    if ((await lstat(target)).isSymbolicLink()) throw new Error('Ticket workspace cannot be a symlink')
+    const canonicalTarget = await realpath(target)
+    if (!isWithin(canonicalRoot, canonicalTarget)) {
+      throw new Error('Ticket workspace escapes work-root')
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error
+    let ancestor = dirname(target)
+    while (!existsSync(ancestor) && ancestor !== dirname(ancestor)) ancestor = dirname(ancestor)
+    const canonicalAncestor = await realpath(ancestor)
+    if (!isWithin(canonicalRoot, canonicalAncestor)) {
+      throw new Error('Ticket workspace escapes work-root')
+    }
+  }
+}
+
+function prepareEnvironment(env: Record<string, string> | undefined,
+  workspace: ShellExecParams['workspace'], target: string): Record<string, string> {
+  const result = scrubbedEnv()
+  for (const key of PREPARE_ENV_KEYS) delete result[key]
+  delete result.DSH_SUPERAGENT_DIR
+  delete result.SSH_AUTH_SOCK
+  delete result.SSH_AGENT_PID
+  if (workspace === undefined) return result
+  const values: Record<string, string | undefined> = {
+    DSH_SUPERAGENT_GITHUB_REPOSITORY: workspace.repository,
+    DSH_SUPERAGENT_GITHUB_NUMBER: workspace.number,
+    DSH_SUPERAGENT_GITHUB_PR_HEAD: workspace.prHead,
+    DSH_SUPERAGENT_NAME: workspace.name,
+    DSH_SUPERAGENT_TICKET: workspace.ticket,
+  }
+  for (const key of PREPARE_ENV_KEYS) {
+    const value = values[key] ?? env?.[key]
+    if (value !== undefined) result[key] = value
+  }
+  result.DSH_SUPERAGENT_DIR = target
+  return result
+}
+
+async function verifyWorkspace(target: string, repository: string): Promise<void> {
+  let origin: string
+  try {
+    const output = await execFileAsync('git', ['-C', target, 'remote', 'get-url', 'origin'], {
+      encoding: 'utf8',
+      env: scrubbedEnv(),
+    })
+    origin = output.stdout.trim()
+  } catch (error) {
+    throw new Error(`prepared workspace is not a Git checkout: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const actualRepository = repositoryFromOrigin(origin)
+  if (actualRepository !== repository.toLowerCase()) {
+    throw new Error(`prepared workspace origin mismatch: expected ${repository}, got ${actualRepository ?? 'an unrecognized GitHub origin'}`)
+  }
+}
+
+function repositoryFromOrigin(origin: string): string | undefined {
+  const match = origin.match(/^(?:https?:\/\/(?:[^/@]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/]+\/[^/]+?)(?:\.git)?$/i)
+  return match?.[1].toLowerCase()
+}
+
+/** 在 daemon 本机跑一次准备命令；`$DIR` 是远程 Ticket 目录。 */
+async function runPrepare(template: string, target: string, env: Record<string, string> | undefined,
+  workspace?: ShellExecParams['workspace']): Promise<void> {
   await mkdir(dirname(target), { recursive: true })
   const command = template.replaceAll('$DIR', target)
   await new Promise<void>((done, reject) => {
-    const child = spawn('bash', ['-lc', command], { env: scrubbedEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn('bash', workspace === undefined ? ['-lc', command] : ['--noprofile', '--norc', '-c', command], {
+      cwd: dirname(target),
+      env: prepareEnvironment(env, workspace, target),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
     let err = ''
+    let timedOut = false
+    let forceKillTimer: NodeJS.Timeout | undefined
+    const timeout = setTimeout(() => {
+      timedOut = true
+      try { child.kill('SIGTERM') } catch { /* 子进程可能已退出 */ }
+      forceKillTimer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* 子进程可能已退出 */ }
+      }, DEFAULT_GRACE_MS)
+    }, PREPARE_TIMEOUT_MS)
+    const clearTimers = (): void => {
+      clearTimeout(timeout)
+      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer)
+    }
     child.stderr?.on('data', (chunk: Buffer) => { err += chunk.toString('utf8') })
-    child.on('error', (error: Error) => { reject(new Error(`${error.message}\n${err}`.trim())) })
+    child.on('error', (error: Error) => {
+      clearTimers()
+      reject(new Error(`${error.message}\n${err}`.trim()))
+    })
     child.on('close', (code) => {
+      clearTimers()
+      if (timedOut) return reject(new Error(`prepare timed out after ${PREPARE_TIMEOUT_MS}ms\n${err}`.trim()))
       if (code === 0) done()
       else reject(new Error(err.trim() || `prepare exited with ${code}`))
     })
@@ -168,10 +376,20 @@ async function runPrepare(template: string, target: string): Promise<void> {
 }
 
 function startCommand(id: number, spawnId: string, target: string, command: string,
-  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined): void {
+  env: Record<string, string> | undefined, graceMs: number | undefined, stdin: string | undefined,
+  workspace?: ShellExecParams['workspace']): void {
+  const commandEnv = { ...scrubbedEnv(), ...(env ?? {}) }
+  if (workspace !== undefined) {
+    commandEnv.DSH_SUPERAGENT_DIR = target
+    commandEnv.DSH_SUPERAGENT_GITHUB_REPOSITORY = workspace.repository
+    commandEnv.DSH_SUPERAGENT_TICKET = workspace.ticket
+    if (workspace.name !== undefined) commandEnv.DSH_SUPERAGENT_NAME = workspace.name
+    if (workspace.number !== undefined) commandEnv.DSH_SUPERAGENT_GITHUB_NUMBER = workspace.number
+    if (workspace.prHead !== undefined) commandEnv.DSH_SUPERAGENT_GITHUB_PR_HEAD = workspace.prHead
+  }
   const child = spawn('bash', ['-lc', command], {
     cwd: target,
-    env: { ...scrubbedEnv(), ...(env ?? {}) },
+    env: commandEnv,
     stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   })
 
@@ -181,7 +399,6 @@ function startCommand(id: number, spawnId: string, target: string, command: stri
     exited: false,
     exitInfo: null,
   }
-  live.set(spawnId, entry)
   live.set(spawnId, entry)
 
   if (stdin !== undefined && child.stdin !== null) child.stdin.end(String(stdin))
@@ -208,7 +425,13 @@ function startCommand(id: number, spawnId: string, target: string, command: stri
 /** 终止进程：先 SIGTERM，宽限期后升级为 SIGKILL。 */
 function handleTerminate(id: number, params: TerminateParams): void {
   const entry = live.get(params.spawnId)
-  if (entry === undefined) return reply(id, { terminated: false, reason: 'unknown' })
+  if (entry === undefined) {
+    if (preparingSpawns.has(params.spawnId)) {
+      cancelledSpawns.add(params.spawnId)
+      return reply(id, { terminated: true, reason: 'cancelled-before-spawn' })
+    }
+    return reply(id, { terminated: false, reason: 'unknown' })
+  }
   if (entry.exited) return reply(id, { terminated: false, reason: 'already-exited' })
 
   const grace = params.graceMs ?? entry.graceMs
@@ -229,6 +452,11 @@ function route(msg: Record<string, unknown>): void {
     switch (method) {
       case Methods.ShellExec:
         return handleShellExec(id, params as unknown as ShellExecParams)
+      case Methods.WorkspaceExec: {
+        const workspace = (params as unknown as ShellExecParams).workspace
+        if (workspace === undefined) return fail(id, 'workspace context is required')
+        return handleShellExec(id, params as unknown as ShellExecParams)
+      }
       case Methods.Terminate:
         return handleTerminate(id, params as unknown as TerminateParams)
       default:
@@ -239,6 +467,10 @@ function route(msg: Record<string, unknown>): void {
 
 /** 清理全部在跑进程。断连与退出时调用，避免遗留孤儿进程。 */
 function cleanup(): void {
+  for (const spawnId of preparingSpawns) {
+    cancelledSpawns.add(spawnId)
+    disconnectedSpawns.add(spawnId)
+  }
   for (const [, entry] of live) {
     try { entry.child.kill('SIGTERM') } catch { /* 已退出 */ }
   }

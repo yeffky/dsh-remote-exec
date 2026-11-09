@@ -9,6 +9,7 @@
  *     name: dsh-remote-exec
  *     config:
  *       cwd: /work
+ *       requireWorkspaceContext: true
  *       timeoutMs: 5000
  *       maxTimeoutMs: 5000
  *
@@ -23,6 +24,7 @@ import { RemoteShellExecutor } from './shell-remote.ts'
 
 export const Config = z.object({
   cwd: z.string().default('/').description('默认工作目录；每次执行的 workdir 可覆盖它。'),
+  requireWorkspaceContext: z.boolean().default(false).description('专用于 Superagent 时要求每条命令都携带仓库与 Ticket 身份，缺少时拒绝默认 cwd。'),
   timeoutMs: z.number().default(120_000).description('默认超时，毫秒。'),
   maxTimeoutMs: z.number().default(600_000).description('超时上限，毫秒。'),
   maxOutputBytes: z.number().default(65_536).description('标准输出采集上限，字节。'),

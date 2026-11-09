@@ -26,12 +26,14 @@ import type {
 import { basename } from 'node:path'
 import type { SubprocessOutputRead } from '@deepseek-ai/dsh-subprocess'
 import { Methods } from '../shared/protocol.ts'
+import type { ShellExecParams } from '../shared/protocol.ts'
 import type { ExitInfo, Peer, RemoteHub, SpawnState } from './hub.ts'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_MAX_TIMEOUT_MS = 600_000
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 const DEFAULT_GRACE_MS = 3_000
+const WORKSPACE_START_TIMEOUT_MS = 11 * 60_000
 /** 每个流在云端保留的窗口，超过后旧块被丢弃并标记 lossy。 */
 const COLLECT_TAIL = 2 * 1024 * 1024
 
@@ -46,6 +48,23 @@ const ENV_OVERRIDES: Readonly<Record<string, string>> = {
 const clamp = (value: number | undefined, min: number, max: number, fallback: number): number => {
   const n = value !== undefined && Number.isFinite(value) ? value : fallback
   return Math.min(Math.max(n, min), max)
+}
+
+function workspaceFromEnv(env: Record<string, string> | undefined): NonNullable<ShellExecParams['workspace']> | undefined {
+  const values = env ?? {}
+  const repository = values.DSH_SUPERAGENT_GITHUB_REPOSITORY
+  const ticket = values.DSH_SUPERAGENT_TICKET
+  if (repository === undefined && ticket === undefined) return undefined
+  if (repository === undefined || ticket === undefined) {
+    throw new Error('Superagent workspace context requires both repository and ticket identifiers')
+  }
+  return {
+    repository,
+    ticket,
+    ...values.DSH_SUPERAGENT_NAME === undefined ? {} : { name: values.DSH_SUPERAGENT_NAME },
+    ...values.DSH_SUPERAGENT_GITHUB_NUMBER === undefined ? {} : { number: values.DSH_SUPERAGENT_GITHUB_NUMBER },
+    ...values.DSH_SUPERAGENT_GITHUB_PR_HEAD === undefined ? {} : { prHead: values.DSH_SUPERAGENT_GITHUB_PR_HEAD },
+  }
 }
 
 type Stream = 'stdout' | 'stderr'
@@ -202,6 +221,7 @@ class RemoteShellProcess implements SpawnState {
 
 export interface RemoteShellExecutorConfig {
   cwd?: string
+  requireWorkspaceContext?: boolean
   timeoutMs?: number
   maxTimeoutMs?: number
   maxOutputBytes?: number
@@ -223,6 +243,7 @@ export class RemoteShellExecutor {
     this.hub = hub
     this.config = {
       cwd: config.cwd ?? '/',
+      requireWorkspaceContext: config.requireWorkspaceContext ?? false,
       timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxTimeoutMs: config.maxTimeoutMs ?? DEFAULT_MAX_TIMEOUT_MS,
       maxOutputBytes: config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
@@ -252,10 +273,11 @@ export class RemoteShellExecutor {
    *
    * super-agent 用 `<executionRoot>/<ticket>` 给每个工单分配目录，这个路径只在
    * agent loop 所在的机器上有意义；执行主机有它自己的根，由 `ready` 上报。
-   * 我们只取最后一段作为标识，由执行主机拼到自己的根上——云端因此不需要知道
-   * 执行主机的磁盘布局，执行主机也不需要理解工单是什么。
+   * Superagent worker 请求携带仓库与 Ticket 标识时，使用 Ticket 标识作为远程
+   * 目录，避免插件配置里的默认 cwd 覆盖 Ticket 目录。其他 Session 保持兼容。
    */
-  private dirFor(peer: Peer, workdir: string): string {
+  private dirFor(peer: Peer, workdir: string, workspace?: ShellExecParams['workspace']): string {
+    if (workspace !== undefined) return workspace.ticket
     const root = peer.workRoot
     if (root !== undefined) {
       // 路径已落在执行主机的根之下时，取相对部分，保留可能的多级子目录。
@@ -269,6 +291,10 @@ export class RemoteShellExecutor {
   /** 启动远程命令，返回 live handle。 */
   async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     const peer: Peer = this.hub.peer()
+    const workspace = workspaceFromEnv({ ...spec.env, ...spec.dshEnv })
+    if (this.config.requireWorkspaceContext && workspace === undefined) {
+      throw new Error('Superagent workspace context is missing; refusing to run from the default cwd')
+    }
     const spawnId = `sh-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const proc = new RemoteShellProcess(spawnId)
     proc.stdoutCap = spec.stdoutMaxBytes
@@ -283,9 +309,7 @@ export class RemoteShellExecutor {
     // 首个原因决定分类：定时器先触发就是 timedOut，abort 先触发就是 aborted。
     let timedOut = false
     let aborted = false
-    const timer = spec.onExpiry === 'kill'
-      ? setTimeout(() => { timedOut = true; proc.kill() }, spec.timeoutMs)
-      : undefined
+    let timer: NodeJS.Timeout | undefined
     const onAbort = (): void => { aborted = true; proc.kill() }
     if (spec.signal !== undefined) {
       if (spec.signal.aborted) onAbort()
@@ -299,14 +323,25 @@ export class RemoteShellExecutor {
       peer.spawns.delete(spawnId)
     })
 
-    peer.call(Methods.ShellExec, {
+    const remoteEnv = { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv }
+    if (workspace !== undefined) delete remoteEnv.DSH_SUPERAGENT_DIR
+
+    peer.call(workspace === undefined ? Methods.ShellExec : Methods.WorkspaceExec, {
       spawnId,
       command: spec.command,
-      dir: this.dirFor(peer, spec.workdir),
-      env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
+      dir: this.dirFor(peer, spec.workdir, workspace),
+      ...workspace === undefined ? {} : { workspace },
+      env: remoteEnv,
       graceMs: this.config.graceMs,
       ...spec.stdin === undefined ? {} : { stdin: spec.stdin },
-    }, 120_000).catch((error: unknown) => {
+    }, workspace === undefined ? 120_000 : WORKSPACE_START_TIMEOUT_MS).then(() => {
+      // workspace prepare 可能需要下载仓库；shell timeout 从远程命令真正启动后计时。
+      if (aborted) {
+        proc.kill()
+      } else if (spec.onExpiry === 'kill' && proc.status === 'running') {
+        timer = setTimeout(() => { timedOut = true; proc.kill() }, spec.timeoutMs)
+      }
+    }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       proc.push('stderr', Buffer.from(`spawn failed: ${message}\n`), Number.MAX_SAFE_INTEGER)
       proc.settleWith({ exitCode: null, signal: null })

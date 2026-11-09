@@ -115,6 +115,26 @@ super-agent 原文第 8.4 节把两条风险列为开放问题：
 「不回退本地」是刻意的：静默回退会让调用方以为命令在目标环境执行，实际却
 跑在别处，这种错误比直接失败危险得多。
 
+## Ticket 工作区映射
+
+Superagent worker 的 Shell 请求含有仓库标识和 Ticket id 时，云端改用
+`workspaceExec` RPC，并以 Ticket id 作为远程目录标识。插件不把云端的
+`DSH_SUPERAGENT_DIR` 绝对路径发给 daemon；daemon 在自己的 `workRoot` 下创建
+该 Ticket 目录，并用本机 `--prepare` 命令把对应 GitHub 仓库检出到这里。
+
+daemon 只把仓库、Ticket、短名和 PR ref 等 allowlist 字段传给准备命令。准备
+完成后，每条命令都会核对 GitHub `origin` 是否匹配配置的仓库，并把远程
+`DSH_SUPERAGENT_DIR` 改写为 daemon 上的 Ticket 路径。缺少 `--prepare`、检出
+失败或 origin 不匹配时，命令会失败，不会在空目录或插件仓库中继续。
+
+普通 Shell Session 没有 Superagent workspace metadata 时，保留原有 `cwd` 与
+相对目录映射行为。旧 daemon 不认识 `workspaceExec`，会以 unknown method 拒绝，
+不会把 Ticket id 当普通目录执行。
+
+每个 Ticket 都会独立 clone；daemon 不会自动清理已结束 Ticket 的目录。当前
+`workRoot` 检查只约束命令的当前目录，不是 OS 文件系统沙箱；命令仍以 daemon
+用户权限运行，可以访问其他可读写路径。
+
 ## 五、输出传输
 
 daemon 按 64 KiB 分块推送，每块带整流的字节偏移。云端保留每个流最近 2 MiB，
@@ -137,10 +157,8 @@ daemon 按 64 KiB 分块推送，每块带整流的字节偏移。云端保留�
 - 多设备调度：`hub.peer()` 只取第一台可用设备
 - 文件系统远程化：`ctx.fs` 仍指向云端，因此执行主机上的文件对 Executor
   不可见 —— 这是当前最大的功能缺口
-- **Ticket 目录不匹配**：Executor 拿到的 ticket 目录是云端路径
-  （`<stateDir>/work/<ticket>`），而执行主机的工作根是另一个路径，因此该目录
-  落在 `--work-root` 之外，daemon 会拒绝。实测中 Executor 会自行降级到工作根内
-  执行，对 `hostname` 这类与环境无关的命令结果不受影响，但**文件类任务会失败**。
-  正确做法与 `ctx.fs` 远程化一并解决：让两端使用同一路径语义，或由 daemon 做
-  路径映射
+- **daemon Git 凭据仍在执行主机**：`--prepare` 的 clone 使用执行主机已有的 Git
+  credential helper。凭据代理尚未实现前，不要把 PAT 写进 prepare 命令或环境。
+- **Ticket clone 不自动回收**：已结束 Ticket 的目录留在 `--work-root`，需要运维侧
+  定期清理。
 - 压缩：输出量大时未压缩

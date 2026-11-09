@@ -13,6 +13,7 @@ export const PROTOCOL_VERSION = 1
 /** 方法名常量，避免字符串拼写错误。 */
 export const Methods = {
   ShellExec: 'shellExec',
+  WorkspaceExec: 'workspaceExec',
   ShellStdin: 'shellStdin',
   Terminate: 'terminate',
 } as const
@@ -42,6 +43,14 @@ export interface ShellExecParams {
   command: string
   /** 相对于执行主机 work-root 的目录标识；空串表示 work-root 本身。 */
   dir: string
+  /** Superagent Ticket 的远程工作区身份，不包含云端绝对路径。 */
+  workspace?: {
+    repository: string
+    ticket: string
+    name?: string
+    number?: string
+    prHead?: string
+  }
   env?: Record<string, string>
   graceMs?: number
   stdin?: string

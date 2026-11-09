@@ -50,6 +50,7 @@ the shell implementation:
   name: dsh-remote-exec
   config:
     cwd: /work
+    requireWorkspaceContext: true # set for a dedicated Superagent profile
     timeoutMs: 5000
     maxTimeoutMs: 5000
 ```
@@ -68,7 +69,8 @@ The local shell implementation must be disabled, because a context holds only on
 node lib/daemon.js \
   --endpoint ws://<agent-loop-host>:7777 \
   --token <shared secret> \
-  --work-root /path/to/work
+  --work-root /opt/state/superagent/work \
+  --prepare 'git clone --no-hardlinks "https://github.com/${DSH_SUPERAGENT_GITHUB_REPOSITORY}.git" "$DIR" && if [ -n "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-}" ]; then git -C "$DIR" fetch --no-tags origin "$DSH_SUPERAGENT_GITHUB_PR_HEAD" && git -C "$DIR" checkout --detach FETCH_HEAD; fi'
 ```
 
 The daemon connects out, so the execution host needs no inbound port and works
@@ -76,6 +78,26 @@ behind NAT. It keeps no state: restarting it only reconnects.
 
 `--work-root` is the only boundary enforced today — a command whose `cwd` falls
 outside it is refused before it runs.
+
+Set `requireWorkspaceContext: true` on a shell plugin dedicated to Superagent.
+This makes missing repository or Ticket metadata a visible failure instead of
+falling back to the plugin's default `cwd`. Leave it false for general-purpose
+remote Shell sessions.
+
+For a Superagent Executor, each remote Ticket directory is keyed by its Ticket id.
+The shell plugin forwards the configured repository and Ticket metadata, and the
+daemon runs `--prepare` on the execution host when that directory is first used.
+The example clones that repository directly into the Ticket directory, so the
+Worker starts inside the checkout and can search it with `rg` or `grep`. Before
+each command, the daemon verifies that `origin` matches the configured repository.
+If the clone fails or the repository does not match, the command is rejected; it
+never runs in an empty directory or the plugin's checkout. Ticket clones remain in
+`--work-root` until an operator removes them.
+
+The clone uses Git authentication already configured on the execution host. Do not
+put a personal access token in `--prepare` or its environment. Credential proxying
+is not implemented yet; private repository access therefore still depends on the
+execution host's Git credential configuration.
 
 ## Documentation
 
