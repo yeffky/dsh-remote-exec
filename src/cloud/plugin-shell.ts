@@ -24,7 +24,8 @@ import { RemoteShellExecutor } from './shell-remote.ts'
 
 export const Config = z.object({
   cwd: z.string().default('/').description('默认工作目录；每次执行的 workdir 可覆盖它。'),
-  requireWorkspaceContext: z.boolean().default(false).description('专用于 Superagent 时要求每条命令都携带仓库与 Ticket 身份，缺少时拒绝默认 cwd。'),
+  workspaceRepository: z.string().default('').description('独立部署时使用的备用 GitHub 仓库（owner/name）；Superagent 的 GitHub Source 绑定优先。'),
+  requireWorkspaceContext: z.boolean().default(false).description('专用于 Superagent 时要求每条命令都能解析出仓库与 Ticket 身份，缺少时拒绝默认 cwd。'),
   timeoutMs: z.number().default(120_000).description('默认超时，毫秒。'),
   maxTimeoutMs: z.number().default(600_000).description('超时上限，毫秒。'),
   maxOutputBytes: z.number().default(65_536).description('标准输出采集上限，字节。'),
@@ -50,7 +51,19 @@ export function apply(ctx: Context, config: ConfigType): void {
   const hub = service?.hub
   if (hub === undefined) throw new Error('dsh-remote-exec: 缺少 remoteExecHub，请先加载 dsh-remote-exec/hub')
 
-  const remote = new RemoteShellExecutor(hub, config)
+  // Superagent already owns the canonical repository binding. Read it through
+  // its optional SourceHost seam so a Superagent profile does not duplicate it.
+  // Standalone deployments can still use workspaceRepository as a fallback.
+  const repositoryFromOrchestrator = (): string | undefined => {
+    try {
+      const orchestrator = ctx.get('orchestrator') as { context?: (kind: { kind: string; health: string[] }) => {
+        deployment?: { repository?: string }
+      } } | undefined
+      const repository = orchestrator?.context?.({ kind: 'github', health: [] }).deployment?.repository
+      return typeof repository === 'string' && repository !== '' ? repository : undefined
+    } catch { return undefined }
+  }
+  const remote = new RemoteShellExecutor(hub, config, repositoryFromOrchestrator)
 
   class RemoteShellService extends ShellExecutor {
     /**

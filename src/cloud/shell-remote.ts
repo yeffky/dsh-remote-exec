@@ -45,19 +45,35 @@ const ENV_OVERRIDES: Readonly<Record<string, string>> = {
   GIT_PAGER: 'cat',
 }
 
+const TICKET_ID = /^[A-Za-z0-9_-]{1,128}$/
+const GITHUB_REPOSITORY = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/
+const validRepository = (repository: string): boolean => GITHUB_REPOSITORY.test(repository)
+  && repository.split('/').every(part => part !== '.' && part !== '..')
+
 const clamp = (value: number | undefined, min: number, max: number, fallback: number): number => {
   const n = value !== undefined && Number.isFinite(value) ? value : fallback
   return Math.min(Math.max(n, min), max)
 }
 
-function workspaceFromEnv(env: Record<string, string> | undefined): NonNullable<ShellExecParams['workspace']> | undefined {
+function ticketFromSessionId(sessionId: string | undefined): string | undefined {
+  if (sessionId === undefined || !sessionId.startsWith('worker-')) return undefined
+  const ticket = sessionId.slice('worker-'.length)
+  return TICKET_ID.test(ticket) ? ticket : undefined
+}
+
+function workspaceFromEnv(env: Record<string, string> | undefined,
+  configuredRepository: string): NonNullable<ShellExecParams['workspace']> | undefined {
   const values = env ?? {}
-  const repository = values.DSH_SUPERAGENT_GITHUB_REPOSITORY
-  const ticket = values.DSH_SUPERAGENT_TICKET
-  if (repository === undefined && ticket === undefined) return undefined
+  const explicitRepository = values.DSH_SUPERAGENT_GITHUB_REPOSITORY
+  const explicitTicket = values.DSH_SUPERAGENT_TICKET
+  const ticket = explicitTicket ?? ticketFromSessionId(values.DSH_SESSION_ID)
+  if (explicitRepository === undefined && explicitTicket === undefined && ticket === undefined) return undefined
+  const repository = explicitRepository ?? (configuredRepository === '' ? undefined : configuredRepository)
   if (repository === undefined || ticket === undefined) {
-    throw new Error('Superagent workspace context requires both repository and ticket identifiers')
+    throw new Error('Superagent workspace requires a repository and a Ticket id (DSH_SUPERAGENT_TICKET or DSH_SESSION_ID=worker-<ticket>)')
   }
+  if (!validRepository(repository)) throw new Error('Superagent workspace repository must be a GitHub owner/name identifier')
+  if (!TICKET_ID.test(ticket)) throw new Error('Superagent workspace Ticket id is invalid')
   return {
     repository,
     ticket,
@@ -222,6 +238,8 @@ class RemoteShellProcess implements SpawnState {
 export interface RemoteShellExecutorConfig {
   cwd?: string
   requireWorkspaceContext?: boolean
+  /** Optional fallback for a standalone deployment without Superagent's orchestrator service. */
+  workspaceRepository?: string
   timeoutMs?: number
   maxTimeoutMs?: number
   maxOutputBytes?: number
@@ -237,13 +255,20 @@ export interface RemoteShellExecutorConfig {
 export class RemoteShellExecutor {
   private readonly hub: RemoteHub
   private readonly config: Required<RemoteShellExecutorConfig>
+  private readonly workspaceRepositoryProvider?: () => string | undefined
   private readonly live = new Map<string, RemoteShellProcess>()
 
-  constructor(hub: RemoteHub, config: RemoteShellExecutorConfig = {}) {
+  constructor(hub: RemoteHub, config: RemoteShellExecutorConfig = {}, workspaceRepositoryProvider?: () => string | undefined) {
     this.hub = hub
+    this.workspaceRepositoryProvider = workspaceRepositoryProvider
+    const workspaceRepository = config.workspaceRepository ?? ''
+    if (workspaceRepository !== '' && !validRepository(workspaceRepository)) {
+      throw new Error('workspaceRepository must be a GitHub owner/name identifier')
+    }
     this.config = {
       cwd: config.cwd ?? '/',
       requireWorkspaceContext: config.requireWorkspaceContext ?? false,
+      workspaceRepository,
       timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxTimeoutMs: config.maxTimeoutMs ?? DEFAULT_MAX_TIMEOUT_MS,
       maxOutputBytes: config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
@@ -291,7 +316,8 @@ export class RemoteShellExecutor {
   /** 启动远程命令，返回 live handle。 */
   async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     const peer: Peer = this.hub.peer()
-    const workspace = workspaceFromEnv({ ...spec.env, ...spec.dshEnv })
+    const repository = this.workspaceRepositoryProvider?.() || this.config.workspaceRepository
+    const workspace = workspaceFromEnv({ ...spec.env, ...spec.dshEnv }, repository)
     if (this.config.requireWorkspaceContext && workspace === undefined) {
       throw new Error('Superagent workspace context is missing; refusing to run from the default cwd')
     }

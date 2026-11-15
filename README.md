@@ -79,10 +79,14 @@ behind NAT. It keeps no state: restarting it only reconnects.
 `--work-root` is the only boundary enforced today — a command whose `cwd` falls
 outside it is refused before it runs.
 
-Set `requireWorkspaceContext: true` on a shell plugin dedicated to Superagent.
-This makes missing repository or Ticket metadata a visible failure instead of
-falling back to the plugin's default `cwd`. Leave it false for general-purpose
-remote Shell sessions.
+For a shell plugin dedicated to Superagent, set `requireWorkspaceContext: true`.
+The plugin reads the repository from Superagent's existing GitHub Source binding
+and gets the Ticket id from DSH's managed `DSH_SESSION_ID` (`worker-<ticket-id>`).
+The model does not need to repeat the repository or Ticket id. Explicit
+`DSH_SUPERAGENT_GITHUB_REPOSITORY` and `DSH_SUPERAGENT_TICKET` values still take
+precedence. `workspaceRepository` is only a fallback for standalone deployments
+without Superagent's `orchestrator` service. Leave it empty and
+`requireWorkspaceContext` false for general-purpose remote Shell sessions.
 
 For a Superagent Executor, each remote Ticket directory is keyed by its Ticket id.
 The shell plugin forwards the configured repository and Ticket metadata, and the

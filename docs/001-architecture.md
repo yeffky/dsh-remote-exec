@@ -117,8 +117,12 @@ super-agent 原文第 8.4 节把两条风险列为开放问题：
 
 ## Ticket 工作区映射
 
-Superagent worker 的 Shell 请求含有仓库标识和 Ticket id 时，云端改用
-`workspaceExec` RPC，并以 Ticket id 作为远程目录标识。插件不把云端的
+Superagent worker 的 Shell 请求可从现有上下文解析出仓库标识和 Ticket id 时，
+云端改用 `workspaceExec` RPC，并以 Ticket id 作为远程目录标识。插件从 Superagent
+现有 GitHub Source binding 读取仓库，并从 DSH 自动提供的
+`DSH_SESSION_ID=worker-<ticket-id>` 解析 Ticket id；显式环境字段仍优先。
+独立部署可通过 `workspaceRepository` 设置备用仓库。
+插件不把云端的
 `DSH_SUPERAGENT_DIR` 绝对路径发给 daemon；daemon 在自己的 `workRoot` 下创建
 该 Ticket 目录，并用本机 `--prepare` 命令把对应 GitHub 仓库检出到这里。
 
@@ -127,8 +131,8 @@ daemon 只把仓库、Ticket、短名和 PR ref 等 allowlist 字段传给准备
 `DSH_SUPERAGENT_DIR` 改写为 daemon 上的 Ticket 路径。缺少 `--prepare`、检出
 失败或 origin 不匹配时，命令会失败，不会在空目录或插件仓库中继续。
 
-普通 Shell Session 没有 Superagent workspace metadata 时，保留原有 `cwd` 与
-相对目录映射行为。旧 daemon 不认识 `workspaceExec`，会以 unknown method 拒绝，
+普通 Shell Session 没有显式 workspace metadata 或 Worker Session id 时，保留原有 `cwd` 与
+相对目录映射行为；严格模式则拒绝执行。旧 daemon 不认识 `workspaceExec`，会以 unknown method 拒绝，
 不会把 Ticket id 当普通目录执行。
 
 每个 Ticket 都会独立 clone；daemon 不会自动清理已结束 Ticket 的目录。当前
