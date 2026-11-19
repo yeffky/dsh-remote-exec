@@ -349,7 +349,7 @@ export class RemoteShellExecutor {
       peer.spawns.delete(spawnId)
     })
 
-    const remoteEnv = { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv }
+    const remoteEnv: Record<string, string> = { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv }
     if (workspace !== undefined) delete remoteEnv.DSH_SUPERAGENT_DIR
 
     peer.call(workspace === undefined ? Methods.ShellExec : Methods.WorkspaceExec, {

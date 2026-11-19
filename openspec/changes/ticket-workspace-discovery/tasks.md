@@ -18,3 +18,8 @@
 - [ ] 3.1 Add end-to-end daemon tests for correct origin, `rg` discovery, isolated Ticket directories, and preparation failures. Satisfies `remote-execution`: workspace behavior is observable at the Shell boundary.
 - [ ] 3.2 Add path traversal, symlink escape, and credential-environment tests. Satisfies `execution-sandbox`: workspace confinement and credential scrubbing are testable.
 - [x] 3.3 Document daemon `--prepare` configuration for `camera-agent`, Git credential prerequisites, failure messages, and the no-fallback behavior. Satisfies both affected specs.
+> Live deployment: the Ticket workspace coding path was exercised on Superagent
+> against `yeffky/camera-agent` on 2026-11-15, producing [PR #11](https://github.com/yeffky/camera-agent/pull/11).
+> The PR page records the resulting code and emulator evidence; the deployment
+> execution record is the evidence for the daemon RPC path. This does not complete
+> tasks 3.1 and 3.2, which track automated daemon regression and security edge cases.

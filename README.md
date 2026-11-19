@@ -3,9 +3,7 @@
 Run a DeepSeek Harness agent's shell work on the machine that holds the real
 execution environment, while the agent loop stays in the cloud.
 
-> **Status: shell execution implemented and unit-tested; not yet verified on a
-> live DSH deployment.** See `openspec/changes/remote-shell/tasks.md` for exactly
-> what is and is not done.
+> **Status: basic Shell RPC was verified on a live Superagent deployment (2026-11-06); Ticket workspace coding was exercised in a live deployment on 2026-11-15, producing [camera-agent PR #11](https://github.com/yeffky/camera-agent/pull/11). The PR documents the code and emulator evidence, not the daemon RPC path. Automated daemon end-to-end and security edge-case coverage remains incomplete.** See `openspec/changes/remote-shell/tasks.md` and `openspec/changes/ticket-workspace-discovery/tasks.md` for exactly what is and is not done.
 
 ## Why
 
@@ -75,6 +73,13 @@ node lib/daemon.js \
 
 The daemon connects out, so the execution host needs no inbound port and works
 behind NAT. It keeps no state: restarting it only reconnects.
+
+The daemon writes command activity to its service log. On a systemd host, follow
+it with `journalctl -u dsh-remote-exec.service -f`. Entries distinguish commands
+received by the daemon, Bash processes that actually started, and their exit
+status and duration. Workspace preparation commands are logged as well. Common
+inline credential forms are redacted; pass secrets through the environment
+rather than embedding them in command text.
 
 `--work-root` is the only boundary enforced today — a command whose `cwd` falls
 outside it is refused before it runs.

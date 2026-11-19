@@ -12,14 +12,14 @@ import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { RemoteHub } from './hub.ts'
 
-export const Config = z.object({
+export const Config: ReturnType<typeof z.object> = z.object({
   port: z.number().default(7777).description('WebSocket 监听端口；端侧 daemon 主动连接此处。'),
   host: z.string().default('127.0.0.1')
     .description('监听地址。容器内需 0.0.0.0 才能被 Docker 端口映射转发；默认只监听本机。'),
   token: z.string().default('').description('共享令牌；非空时端侧 daemon 必须以 Bearer 提供。'),
 })
 
-export type ConfigType = ReturnType<typeof Config>
+export type ConfigType = { port: number; host: string; token: string }
 
 export const name = 'dsh-remote-exec-hub'
 /** 无依赖：本服务是被其他条目消费的基础设施。 */

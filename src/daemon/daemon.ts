@@ -70,6 +70,18 @@ const log = (...a: unknown[]): void => {
   console.log(new Date().toISOString().slice(11, 19), '[daemon]', ...a)
 }
 
+/** Write a command to the service log without copying common inline credentials. */
+function logBashCommand(eventName: string, details: Record<string, unknown>, command: string): void {
+  const redacted = command
+    .replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^\s"'`]+/gi, '$1[REDACTED]')
+    .replace(/(-----BEGIN [^-]*PRIVATE KEY-----)[\s\S]*?(-----END [^-]*PRIVATE KEY-----)/gi, '$1[REDACTED]$2')
+    .replace(/(https?:\/\/)[^/@\s:]+:[^/@\s]+@/gi, '$1[REDACTED]@')
+    .replace(/((?:--with-token|--user|-u)\s+)(?:"[^"]*"|'[^']*'|[^\s;&|]+)/gi, '$1[REDACTED]')
+    .replace(/(^|[^\w])((?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTHORIZATION)[A-Z0-9_]*|--(?:token|secret|password|passwd|credential|api-key|access-key|private-key|authorization))\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s;&|]+)/gi, '$1$2[REDACTED]')
+    .replace(/(--(?:token|secret|password|passwd|credential|api-key|access-key|private-key|authorization)\s+)(?:"[^"]*"|'[^']*'|[^\s;&|]+)/gi, '$1[REDACTED]')
+  log('bash-command', JSON.stringify({ event: eventName, ...details, command: redacted }))
+}
+
 /** 活跃进程，按 spawnId 索引。连接断开时全部清理。 */
 const live = new Map<string, LiveProcess>()
 const workspacePreparation = new Map<string, Promise<void>>()
@@ -141,6 +153,13 @@ function handleShellExec(id: number, params: ShellExecParams): void {
       target = resolveDir(dir)
     }
   } catch (error) { return fail(id, error) }
+
+  logBashCommand('received', {
+    requestId: id,
+    spawnId,
+    cwd: target,
+    ticket: workspace?.ticket,
+  }, command)
 
   preparingSpawns.add(spawnId)
   void runWithPrepare(id, spawnId, target, command, env, graceMs, stdin, workspace)
@@ -333,7 +352,7 @@ async function verifyWorkspace(target: string, repository: string): Promise<void
 
 function repositoryFromOrigin(origin: string): string | undefined {
   const match = origin.match(/^(?:https?:\/\/(?:[^/@]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/]+\/[^/]+?)(?:\.git)?$/i)
-  return match?.[1].toLowerCase()
+  return match?.[1]?.toLowerCase()
 }
 
 /** 在 daemon 本机跑一次准备命令；`$DIR` 是远程 Ticket 目录。 */
@@ -341,6 +360,8 @@ async function runPrepare(template: string, target: string, env: Record<string, 
   workspace?: ShellExecParams['workspace']): Promise<void> {
   await mkdir(dirname(target), { recursive: true })
   const command = template.replaceAll('$DIR', target)
+  const startedAt = Date.now()
+  logBashCommand('prepare-starting', { cwd: dirname(target), ticket: workspace?.ticket }, command)
   await new Promise<void>((done, reject) => {
     const child = spawn('bash', workspace === undefined ? ['-lc', command] : ['--noprofile', '--norc', '-c', command], {
       cwd: dirname(target),
@@ -362,12 +383,22 @@ async function runPrepare(template: string, target: string, env: Record<string, 
       if (forceKillTimer !== undefined) clearTimeout(forceKillTimer)
     }
     child.stderr?.on('data', (chunk: Buffer) => { err += chunk.toString('utf8') })
+    child.on('spawn', () => {
+      log('bash-command', JSON.stringify({ event: 'prepare-started', pid: child.pid, ticket: workspace?.ticket }))
+    })
     child.on('error', (error: Error) => {
       clearTimers()
+      log('bash-command', JSON.stringify({ event: 'prepare-spawn-error', ticket: workspace?.ticket, error: error.message }))
       reject(new Error(`${error.message}\n${err}`.trim()))
     })
     child.on('close', (code) => {
       clearTimers()
+      log('bash-command', JSON.stringify({
+        event: timedOut ? 'prepare-timed-out' : 'prepare-exited',
+        ticket: workspace?.ticket,
+        exitCode: code,
+        durationMs: Date.now() - startedAt,
+      }))
       if (timedOut) return reject(new Error(`prepare timed out after ${PREPARE_TIMEOUT_MS}ms\n${err}`.trim()))
       if (code === 0) done()
       else reject(new Error(err.trim() || `prepare exited with ${code}`))
@@ -387,6 +418,13 @@ function startCommand(id: number, spawnId: string, target: string, command: stri
     if (workspace.number !== undefined) commandEnv.DSH_SUPERAGENT_GITHUB_NUMBER = workspace.number
     if (workspace.prHead !== undefined) commandEnv.DSH_SUPERAGENT_GITHUB_PR_HEAD = workspace.prHead
   }
+  const startedAt = Date.now()
+  logBashCommand('starting', {
+    requestId: id,
+    spawnId,
+    cwd: target,
+    ticket: workspace?.ticket,
+  }, command)
   const child = spawn('bash', ['-lc', command], {
     cwd: target,
     env: commandEnv,
@@ -406,18 +444,28 @@ function startCommand(id: number, spawnId: string, target: string, command: stri
   if (child.stderr !== null) pipeOutput(spawnId, 'stderr', child.stderr)
 
   child.on('spawn', () => {
+    log('bash-command', JSON.stringify({ event: 'started', requestId: id, spawnId, pid: child.pid }))
     emit(Events.Spawned, { spawnId, pid: child.pid })
     reply(id, { spawnId, pid: child.pid })
   })
   child.on('error', (error: Error) => {
     entry.exited = true
     entry.exitInfo = { exitCode: null, signal: null, error: error.message }
+    log('bash-command', JSON.stringify({ event: 'spawn-error', requestId: id, spawnId, error: error.message }))
     emit(Events.Exit, { spawnId, ...entry.exitInfo })
     fail(id, error)
   })
   child.on('close', (code, signal) => {
     entry.exited = true
     entry.exitInfo = { exitCode: code, signal: signal ?? null }
+    log('bash-command', JSON.stringify({
+      event: 'exited',
+      requestId: id,
+      spawnId,
+      exitCode: code,
+      signal: signal ?? null,
+      durationMs: Date.now() - startedAt,
+    }))
     emit(Events.Exit, { spawnId, exitCode: code, signal: signal ?? null })
   })
 }

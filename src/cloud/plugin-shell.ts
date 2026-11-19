@@ -22,7 +22,7 @@ import z from '@deepseek-ai/schemastery'
 import type { RemoteHub } from './hub.ts'
 import { RemoteShellExecutor } from './shell-remote.ts'
 
-export const Config = z.object({
+export const Config: ReturnType<typeof z.object> = z.object({
   cwd: z.string().default('/').description('默认工作目录；每次执行的 workdir 可覆盖它。'),
   workspaceRepository: z.string().default('').description('独立部署时使用的备用 GitHub 仓库（owner/name）；Superagent 的 GitHub Source 绑定优先。'),
   requireWorkspaceContext: z.boolean().default(false).description('专用于 Superagent 时要求每条命令都能解析出仓库与 Ticket 身份，缺少时拒绝默认 cwd。'),
@@ -32,7 +32,15 @@ export const Config = z.object({
   graceMs: z.number().default(3_000).description('SIGTERM 到 SIGKILL 的宽限期，毫秒。'),
 })
 
-export type ConfigType = ReturnType<typeof Config>
+export type ConfigType = {
+  cwd: string
+  workspaceRepository: string
+  requireWorkspaceContext: boolean
+  timeoutMs: number
+  maxTimeoutMs: number
+  maxOutputBytes: number
+  graceMs: number
+}
 
 export const name = 'dsh-remote-exec-shell'
 /** 依赖连接服务；缺少时本条目保持 pending 而不是自行监听端口。 */
